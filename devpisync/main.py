@@ -1,12 +1,16 @@
 import argparse
 import sys
+from pathlib import Path
 import pip.req
 import devpi
 import urllib
+from requests import get
 from os import path
 from devpi import main as devpi
 from devpi_common.metadata import get_sorted_versions, parse_requirement, Version
 from devpi_common.viewhelp import ViewLinkStore, iter_toxresults
+import tempfile
+from argparse import Namespace
 
 def options():
     parser = argparse.ArgumentParser()
@@ -27,7 +31,7 @@ def options():
 
     return parser.parse_args()
 
-class pipsy():
+class pypisync():
     def __init__(self):
         self.pipsession = 'session'
         self.pkglist = {}
@@ -42,7 +46,8 @@ class pipsy():
         if opts.orig_pass:
             self.orig_pass = opts.orig_pass
         if opts.requirements:
-            self.get_req_from_file()
+            self.requirements = opts.requirements
+            self._get_req_from_file()
         if opts.package:
             pkg = pip.req.InstallRequirement.from_line(opts.package)
             if self.pkglist.get(pkg.name, False):
@@ -58,7 +63,7 @@ class pipsy():
         self.orig_index = opts.origin_index
         self.dst_url = '{}/{}'.format(self.destination, self.dst_index)
         self.orig_url = '{}/{}'.format(self.origin, self.orig_index)
-        self.devpi = devpipi(self.dst_url, self.dst_user, self.dst_pass)
+        self.devpi = devpipi(self.destination, self.dst_index, self.dst_user, self.dst_pass)
 
     def check_presence(self):
         result = {}
@@ -98,11 +103,15 @@ class pipsy():
         l = self.devpi.get_versions_list(name)
         return l
 
-    def _get_recent(self, pkgspec, versions, index):
+    def _get_recent_devpi(self, pkgspec, versions, index):
         preq = pip.req.InstallRequirement.from_line(pkgspec)
-        valid = list(preq.req.specifier.filter(versions))
-        valid.sort()
         r = self.devpi._query_pkg(pkgspec, index)
+        if r == None:
+            return []
+        valid = list(preq.req.specifier.filter(versions))
+        valid = get_sorted_versions(valid)
+        if len(valid) == 0:
+            return []
         rdict = r.result[valid.pop()]
         result_list = []
         for i in rdict['+links']:
@@ -110,24 +119,69 @@ class pipsy():
                 result_list.append(i['href'])
         return result_list
 
+    def _get_recent_pypi(self, pkgspec, versions):
+        preq = pip.req.InstallRequirement.from_line(pkgspec)
+        r = self._query_pypi(preq.name)
+        if r == None:
+            return []
+        valid = list(preq.req.specifier.filter(versions))
+        valid = get_sorted_versions(valid)
+        if len(valid) == 0:
+            return []
+        rdict = r['releases'][valid.pop()]
+        result_list = []
+        for i in rdict:
+            result_list.append(i['url'])
+        return result_list
+
+    def _query_pypi(self, package, pypihost='https://pypi.python.org', index='pypi'):
+        url = '{}/{}/{}/json'.format(pypihost, index, package)
+        r = get(url)
+        reply = r.json()
+        return reply
+
+    def _query_pypi_pkg_versions(self, pkg):
+        r = self._query_pypi(pkg)
+        versions_list = get_sorted_versions(r['releases'])
+        return versions_list
+
     def sync(self):
+        err = 0
         workdict = self.check_presence() # contain pkgname as key, and bool as value
+        urls_to_download = {}
         for pkg in workdict:
             if not workdict[pkg]:
                 fullspec = pkg + self.pkglist[pkg]
-                versions = self._get_pkg_versions(pkg)
-                pkg_links = self._get_recent(fullspec, versions, self.orig_url)
-
+                versions = self._query_pypi_pkg_versions(pkg)
+                pkg_links = self._get_recent_pypi(fullspec, versions)
+                if len(pkg_links) == 0:
+                    print('WARN: package {} not found in {}!'.format(pkg, self.orig_url))
+                    err = 1
+                else:
+                    urls_to_download[pkg] = pkg_links
+        if err == 1:
+            print("FATAL: some packages couldn't be synchronized")
+            sys.exit(1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for pkg in urls_to_download:
+                for link in urls_to_download[pkg]:
+                    fname = tmpdir + '/' + link.split('/')[-1]
+                    with open(fname, 'wb') as f:
+                        response = get(link)
+                        f.write(response.content)
+                    self.devpi.upload(fname)
 
 class devpipi():
-    def __init__(self, index, user='root', passwd=''):
+    def __init__(self, host, index, user='root', passwd=''):
         self.dir = path.abspath(path.curdir)
-        self.index = index
+        self.index = '{}/{}'.format(host, index)
+        self.indexname = index
         self.user = user
         self.passwd = passwd
         config = [self.dir, 'use', self.index]
         parser = devpi.parse_args(config)
         self.hub = devpi.Hub(parser)
+        self.hub.current.login = host + '/+login'
         self.login()
 
     def _query_pkg(self, pkgname, url=None):
@@ -135,12 +189,17 @@ class devpipi():
             url = self.index
         self.hub.args.spec = pkgname
         req = parse_requirement(self.hub.args.spec)
-        url = self.hub.current.get_project_url(req.project_name)
-        reply = self.hub.http_api("get", url, type="projectconfig")
+        url = self.hub.current.get_project_url(req.project_name, indexname=self.indexname)
+        try:
+            reply = self.hub.http_api("get", url, type="projectconfig")
+        except SystemExit:
+            reply = None
         return reply
 
     def get_versions_list(self, pkgname):
         reply = self._query_pkg(pkgname)
+        if reply == None:
+            return []
         return get_sorted_versions(reply.result)
 
     def get_urls(self, pkgname):
@@ -151,14 +210,21 @@ class devpipi():
         resp = self.hub.http_api("post", self.hub.current.login, input, quiet=False)
         self.hub.current.set_auth(self.user, resp.result["password"])
 
+    def upload(self, fname):
+        f = Path(fname)
+        cwd = path.abspath(path.curdir)
+        res = devpi.main([cwd, 'use', self.index])
+        res = devpi.main([cwd, 'login', self.user, '--password', self.passwd])
+        res = devpi.main([cwd, 'upload', fname])
+
 def main():
     opts = options()
     if not opts.package and not opts.requirements:
         print('provide package or requirements list')
         sys.exit(2)
-    synctool = pipsy()
+    synctool = pypisync()
     synctool.setup(opts)
-    synctool.check_presence()
+    synctool.sync()
 
 if __name__ == '__main__':
     main()
