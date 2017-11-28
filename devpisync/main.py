@@ -137,7 +137,10 @@ class pypisync():
     def _query_pypi(self, package, pypihost='https://pypi.python.org', index='pypi'):
         url = '{}/{}/{}/json'.format(pypihost, index, package)
         r = get(url)
-        reply = r.json()
+        if r.status_code == 404:
+            reply = {'releases': {}}
+        else:
+            reply = r.json()
         return reply
 
     def _query_pypi_pkg_versions(self, pkg):
@@ -160,8 +163,7 @@ class pypisync():
                 else:
                     urls_to_download[pkg] = pkg_links
         if err == 1:
-            print("FATAL: some packages couldn't be synchronized")
-            sys.exit(1)
+            print("WARNING: some packages couldn't be synchronized")
         with tempfile.TemporaryDirectory() as tmpdir:
             for pkg in urls_to_download:
                 for link in urls_to_download[pkg]:
